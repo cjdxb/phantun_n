@@ -1,6 +1,6 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::Stack;
+use fake_tcp::{KeepaliveConfig, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
@@ -101,6 +101,22 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("keepalive_interval")
+                .long("keepalive-interval")
+                .required(false)
+                .value_name("SECONDS")
+                .help("Sets fake TCP keepalive probe interval in seconds, 0 disables keepalive")
+                .default_value("15")
+        )
+        .arg(
+            Arg::new("keepalive_misses")
+                .long("keepalive-misses")
+                .required(false)
+                .value_name("COUNT")
+                .help("Sets how many consecutive keepalive probes can be missed before closing the connection")
+                .default_value("3")
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -146,6 +162,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let keepalive = keepalive_config(&matches);
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -166,7 +183,7 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     //thread::sleep(time::Duration::from_secs(5));
-    let mut stack = Stack::new(tun, tun_local, tun_local6);
+    let mut stack = Stack::new_with_keepalive(tun, tun_local, tun_local6, keepalive);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 
@@ -263,4 +280,26 @@ async fn main() -> io::Result<()> {
     });
 
     tokio::join!(main_loop).0.unwrap()
+}
+
+fn keepalive_config(matches: &clap::ArgMatches) -> KeepaliveConfig {
+    let interval = matches
+        .get_one::<String>("keepalive_interval")
+        .unwrap()
+        .parse()
+        .expect("bad keepalive interval");
+    let max_missed = matches
+        .get_one::<String>("keepalive_misses")
+        .unwrap()
+        .parse()
+        .expect("bad keepalive misses");
+
+    if interval == 0 || max_missed == 0 {
+        KeepaliveConfig::disabled()
+    } else {
+        KeepaliveConfig {
+            interval: time::Duration::from_secs(interval),
+            max_missed,
+        }
+    }
 }

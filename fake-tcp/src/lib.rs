@@ -43,16 +43,16 @@
 pub mod packet;
 
 use bytes::{Bytes, BytesMut};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use packet::*;
-use pnet::packet::{tcp, Packet};
+use pnet::packet::{Packet, tcp};
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc, RwLock,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -64,6 +64,8 @@ const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MPSC_BUFFER_LEN: usize = 128;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+const DEFAULT_KEEPALIVE_INTERVAL: time::Duration = time::Duration::from_secs(15);
+const DEFAULT_KEEPALIVE_MISSES: usize = 3;
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct AddrTuple {
@@ -81,11 +83,13 @@ impl AddrTuple {
 }
 
 struct Shared {
-    tuples: RwLock<HashMap<AddrTuple, flume::Sender<Bytes>>>,
+    tuples: RwLock<HashMap<AddrTuple, Connection>>,
     listening: RwLock<HashSet<u16>>,
     tun: Vec<Arc<Tun>>,
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
+    started: time::Instant,
+    keepalive: KeepaliveConfig,
 }
 
 pub struct Stack {
@@ -95,6 +99,46 @@ pub struct Stack {
     ready: mpsc::Receiver<Socket>,
 }
 
+#[derive(Clone, Copy)]
+pub struct KeepaliveConfig {
+    pub interval: time::Duration,
+    pub max_missed: usize,
+}
+
+impl KeepaliveConfig {
+    pub fn disabled() -> KeepaliveConfig {
+        KeepaliveConfig {
+            interval: time::Duration::ZERO,
+            max_missed: 0,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !self.interval.is_zero() && self.max_missed > 0
+    }
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> KeepaliveConfig {
+        KeepaliveConfig {
+            interval: DEFAULT_KEEPALIVE_INTERVAL,
+            max_missed: DEFAULT_KEEPALIVE_MISSES,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Connection {
+    incoming: flume::Sender<Bytes>,
+    health: Arc<SocketHealth>,
+}
+
+struct SocketHealth {
+    last_rx_ms: AtomicU64,
+    closed: AtomicBool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum State {
     Idle,
     SynSent,
@@ -106,12 +150,25 @@ pub struct Socket {
     shared: Arc<Shared>,
     tun: Arc<Tun>,
     incoming: flume::Receiver<Bytes>,
+    health: Arc<SocketHealth>,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
-    seq: AtomicU32,
-    ack: AtomicU32,
-    last_ack: AtomicU32,
+    seq: Arc<AtomicU32>,
+    ack: Arc<AtomicU32>,
+    last_ack: Arc<AtomicU32>,
     state: State,
+}
+
+impl Shared {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    fn remove_tuple(&self, tuple: &AddrTuple) -> bool {
+        let removed = self.tuples.write().unwrap().remove(tuple).is_some();
+        let _ = self.tuples_purge.send(tuple.clone());
+        removed
+    }
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -129,22 +186,30 @@ impl Socket {
         remote_addr: SocketAddr,
         ack: Option<u32>,
         state: State,
-    ) -> (Socket, flume::Sender<Bytes>) {
+    ) -> (Socket, Connection) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+        let health = Arc::new(SocketHealth {
+            last_rx_ms: AtomicU64::new(shared.now_ms()),
+            closed: AtomicBool::new(false),
+        });
 
         (
             Socket {
                 shared,
                 tun,
                 incoming: incoming_rx,
+                health: health.clone(),
                 local_addr,
                 remote_addr,
-                seq: AtomicU32::new(0),
-                ack: AtomicU32::new(ack.unwrap_or(0)),
-                last_ack: AtomicU32::new(ack.unwrap_or(0)),
+                seq: Arc::new(AtomicU32::new(0)),
+                ack: Arc::new(AtomicU32::new(ack.unwrap_or(0))),
+                last_ack: Arc::new(AtomicU32::new(ack.unwrap_or(0))),
                 state,
             },
-            incoming_tx,
+            Connection {
+                incoming: incoming_tx,
+                health,
+            },
         )
     }
 
@@ -172,6 +237,10 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
+                if self.health.closed.load(Ordering::Relaxed) {
+                    return None;
+                }
+
                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
                 self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
                 self.tun.send(&buf).await.ok().and(Some(()))
@@ -189,37 +258,155 @@ impl Socket {
     /// and this socket must be closed.
     pub async fn recv(&self, buf: &mut [u8]) -> Option<usize> {
         match self.state {
-            State::Established => {
-                self.incoming.recv_async().await.ok().and_then(|raw_buf| {
+            State::Established => loop {
+                let raw_buf = self.incoming.recv_async().await.ok()?;
+                let res = {
                     let (_v4_packet, tcp_packet) = parse_ip_packet(&raw_buf).unwrap();
 
                     if (tcp_packet.get_flags() & tcp::TcpFlags::RST) != 0 {
                         info!("Connection {} reset by peer", self);
+                        self.close();
                         return None;
                     }
 
+                    self.health
+                        .last_rx_ms
+                        .store(self.shared.now_ms(), Ordering::Relaxed);
+
                     let payload = tcp_packet.payload();
 
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    let last_ask = self.last_ack.load(Ordering::Relaxed);
-                    self.ack.store(new_ack, Ordering::Relaxed);
-
-                    if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
-                        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
-                        if let Err(e) = self.tun.try_send(&buf) {
-                            // This should not really happen as we have not sent anything for
-                            // quite some time...
-                            info!("Connection {} unable to send idling ACK back: {}", self, e)
+                    if payload.is_empty() {
+                        if tcp_packet.get_flags() == tcp::TcpFlags::ACK
+                            && tcp_packet.get_sequence()
+                                == self.ack.load(Ordering::Relaxed).wrapping_sub(1)
+                        {
+                            self.send_ack();
                         }
+
+                        None
+                    } else {
+                        let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                        let last_ask = self.last_ack.load(Ordering::Relaxed);
+                        self.ack.store(new_ack, Ordering::Relaxed);
+
+                        if new_ack.overflowing_sub(last_ask).0 > MAX_UNACKED_LEN {
+                            let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                            if let Err(e) = self.tun.try_send(&buf) {
+                                // This should not really happen as we have not sent anything for
+                                // quite some time...
+                                info!("Connection {} unable to send idling ACK back: {}", self, e)
+                            }
+                        }
+
+                        buf[..payload.len()].copy_from_slice(payload);
+
+                        Some(payload.len())
                     }
+                };
 
-                    buf[..payload.len()].copy_from_slice(payload);
-
-                    Some(payload.len())
-                })
-            }
+                if let Some(size) = res {
+                    return Some(size);
+                }
+            },
             _ => unreachable!(),
         }
+    }
+
+    fn send_ack(&self) {
+        let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+        if let Err(e) = self.tun.try_send(&buf) {
+            debug!("Unable to send ACK to remote end: {}", e);
+        }
+    }
+
+    fn send_keepalive_probe(
+        tun: &Tun,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        seq: u32,
+        ack: u32,
+    ) -> Option<()> {
+        let buf = build_tcp_packet(
+            local_addr,
+            remote_addr,
+            seq.wrapping_sub(1),
+            ack,
+            tcp::TcpFlags::ACK,
+            None,
+        );
+
+        tun.try_send(&buf).ok().and(Some(()))
+    }
+
+    fn start_keepalive(&self) {
+        if !self.shared.keepalive.is_enabled() {
+            return;
+        }
+
+        let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
+        let shared = self.shared.clone();
+        let tun = self.tun.clone();
+        let health = self.health.clone();
+        let seq = self.seq.clone();
+        let ack = self.ack.clone();
+        let local_addr = self.local_addr;
+        let remote_addr = self.remote_addr;
+        let keepalive = shared.keepalive;
+
+        tokio::spawn(async move {
+            let mut last_seen = health.last_rx_ms.load(Ordering::Relaxed);
+            let mut missed = 0usize;
+
+            loop {
+                time::sleep(keepalive.interval).await;
+
+                if health.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let current_seen = health.last_rx_ms.load(Ordering::Relaxed);
+                if current_seen != last_seen {
+                    last_seen = current_seen;
+                    missed = 0;
+                    continue;
+                }
+
+                if missed >= keepalive.max_missed {
+                    info!(
+                        "Connection from {} to {} timed out after {} missed keepalive probes",
+                        local_addr, remote_addr, missed
+                    );
+                    health.closed.store(true, Ordering::Relaxed);
+                    shared.remove_tuple(&tuple);
+                    return;
+                }
+
+                missed += 1;
+                if Socket::send_keepalive_probe(
+                    &tun,
+                    local_addr,
+                    remote_addr,
+                    seq.load(Ordering::Relaxed),
+                    ack.load(Ordering::Relaxed),
+                )
+                .is_none()
+                {
+                    warn!(
+                        "Unable to send keepalive probe from {} to {}",
+                        local_addr, remote_addr
+                    );
+                    health.closed.store(true, Ordering::Relaxed);
+                    shared.remove_tuple(&tuple);
+                    return;
+                }
+            }
+        });
+    }
+
+    fn close(&self) {
+        self.health.closed.store(true, Ordering::Relaxed);
+        let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
+        self.shared.remove_tuple(&tuple);
     }
 
     async fn accept(mut self) {
@@ -249,6 +436,7 @@ impl Socket {
                             // found our ACK
                             self.seq.fetch_add(1, Ordering::Relaxed);
                             self.state = State::Established;
+                            self.start_keepalive();
 
                             info!("Connection from {:?} established", self.remote_addr);
                             let ready = self.shared.ready.clone();
@@ -300,6 +488,7 @@ impl Socket {
                                 self.tun.send(&buf).await.unwrap();
 
                                 self.state = State::Established;
+                                self.start_keepalive();
 
                                 info!("Connection to {:?} established", self.remote_addr);
                                 return Some(());
@@ -324,20 +513,20 @@ impl Drop for Socket {
     fn drop(&mut self) {
         let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
         // dissociates ourself from the dispatch map
-        assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
-        // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        let removed = self.shared.remove_tuple(&tuple);
 
-        let buf = build_tcp_packet(
-            self.local_addr,
-            self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
-            0,
-            tcp::TcpFlags::RST,
-            None,
-        );
-        if let Err(e) = self.tun.try_send(&buf) {
-            warn!("Unable to send RST to remote end: {}", e);
+        if !self.health.closed.swap(true, Ordering::Relaxed) && removed {
+            let buf = build_tcp_packet(
+                self.local_addr,
+                self.remote_addr,
+                self.seq.load(Ordering::Relaxed),
+                0,
+                tcp::TcpFlags::RST,
+                None,
+            );
+            if let Err(e) = self.tun.try_send(&buf) {
+                warn!("Unable to send RST to remote end: {}", e);
+            }
         }
 
         info!("Fake TCP connection to {} closed", self);
@@ -362,6 +551,15 @@ impl Stack {
     /// of reader will be spawned later. This allows user to utilize the performance
     /// benefit of Multiqueue Tun support on machines with SMP.
     pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
+        Stack::new_with_keepalive(tun, local_ip, local_ip6, KeepaliveConfig::default())
+    }
+
+    pub fn new_with_keepalive(
+        tun: Vec<Tun>,
+        local_ip: Ipv4Addr,
+        local_ip6: Option<Ipv6Addr>,
+        keepalive: KeepaliveConfig,
+    ) -> Stack {
         let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
         let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);
         let (tuples_purge_tx, _tuples_purge_rx) = broadcast::channel(16);
@@ -371,6 +569,8 @@ impl Stack {
             listening: RwLock::new(HashSet::new()),
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
+            started: time::Instant::now(),
+            keepalive,
         });
 
         for t in tun {
@@ -453,7 +653,7 @@ impl Stack {
         shared: Arc<Shared>,
         mut tuples_purge: broadcast::Receiver<AddrTuple>,
     ) {
-        let mut tuples: HashMap<AddrTuple, flume::Sender<Bytes>> = HashMap::new();
+        let mut tuples: HashMap<AddrTuple, Connection> = HashMap::new();
 
         loop {
             let mut buf = BytesMut::zeroed(MAX_PACKET_LEN);
@@ -472,7 +672,8 @@ impl Stack {
 
                             let tuple = AddrTuple::new(local_addr, remote_addr);
                             if let Some(c) = tuples.get(&tuple) {
-                                if c.send_async(buf).await.is_err() {
+                                c.health.last_rx_ms.store(shared.now_ms(), Ordering::Relaxed);
+                                if c.incoming.send_async(buf).await.is_err() {
                                     trace!("Cache hit, but receiver already closed, dropping packet");
                                 }
 
@@ -490,7 +691,10 @@ impl Stack {
                                 if let Some(c) = sender {
                                     trace!("Storing connection information into local tuples");
                                     tuples.insert(tuple, c.clone());
-                                    c.send_async(buf).await.unwrap();
+                                    c.health.last_rx_ms.store(shared.now_ms(), Ordering::Relaxed);
+                                    if c.incoming.send_async(buf).await.is_err() {
+                                        trace!("Receiver already closed, dropping packet");
+                                    }
                                     continue;
                                 }
                             }

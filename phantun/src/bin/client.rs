@@ -1,6 +1,6 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::{Socket, Stack};
+use fake_tcp::{KeepaliveConfig, Socket, Stack};
 use log::{debug, error, info};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
@@ -101,6 +101,22 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("keepalive_interval")
+                .long("keepalive-interval")
+                .required(false)
+                .value_name("SECONDS")
+                .help("Sets fake TCP keepalive probe interval in seconds, 0 disables keepalive")
+                .default_value("15")
+        )
+        .arg(
+            Arg::new("keepalive_misses")
+                .long("keepalive-misses")
+                .required(false)
+                .value_name("COUNT")
+                .help("Sets how many consecutive keepalive probes can be missed before reconnecting")
+                .default_value("3")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -111,12 +127,11 @@ async fn main() -> io::Result<()> {
 
     let ipv4_only = matches.get_flag("ipv4_only");
 
-    let remote_addr = tokio::net::lookup_host(matches.get_one::<String>("remote").unwrap())
+    let remote = matches.get_one::<String>("remote").unwrap().clone();
+    let initial_remote_addr = resolve_remote_addr(&remote, ipv4_only)
         .await
-        .expect("bad remote address or host")
-        .find(|addr| !ipv4_only || addr.is_ipv4())
-        .expect("unable to resolve remote host name");
-    info!("Remote address is: {}", remote_addr);
+        .expect("bad remote address or host");
+    info!("Remote address is: {}", initial_remote_addr);
 
     let tun_local: Ipv4Addr = matches
         .get_one::<String>("tun_local")
@@ -147,6 +162,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let keepalive = keepalive_config(&matches);
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -160,8 +176,8 @@ async fn main() -> io::Result<()> {
         .build()
         .unwrap();
 
-    if remote_addr.is_ipv6() {
-        assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
+    if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
+        assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
     }
 
     info!("Created TUN device {}", tun[0].name());
@@ -169,23 +185,35 @@ async fn main() -> io::Result<()> {
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    let mut stack = Stack::new_with_keepalive(tun, tun_peer, tun_peer6, keepalive);
 
     let main_loop = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
-            if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+            if let Some(sock) = connections.read().await.get(&udp_remote_addr).cloned() {
+                if sock.send(&buf_r[..size]).await.is_none() {
+                    connections.write().await.remove(&udp_remote_addr);
+                    debug!("removed stale fake TCP socket from connections table");
+                }
                 continue;
             }
 
             info!("New UDP client from {}", udp_remote_addr);
+            let remote_addr = match resolve_remote_addr(&remote, ipv4_only).await {
+                Ok(remote_addr) => remote_addr,
+                Err(e) => {
+                    error!("Unable to resolve remote host {}: {}", remote, e);
+                    continue;
+                }
+            };
+
             let sock = stack.connect(remote_addr).await;
             if sock.is_none() {
                 error!("Unable to connect to remote {}", remote_addr);
@@ -207,11 +235,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -237,10 +267,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -251,7 +278,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);
@@ -324,4 +353,38 @@ async fn main() -> io::Result<()> {
     });
 
     tokio::join!(main_loop).0.unwrap()
+}
+
+fn keepalive_config(matches: &clap::ArgMatches) -> KeepaliveConfig {
+    let interval = matches
+        .get_one::<String>("keepalive_interval")
+        .unwrap()
+        .parse()
+        .expect("bad keepalive interval");
+    let max_missed = matches
+        .get_one::<String>("keepalive_misses")
+        .unwrap()
+        .parse()
+        .expect("bad keepalive misses");
+
+    if interval == 0 || max_missed == 0 {
+        KeepaliveConfig::disabled()
+    } else {
+        KeepaliveConfig {
+            interval: time::Duration::from_secs(interval),
+            max_missed,
+        }
+    }
+}
+
+async fn resolve_remote_addr(remote: &str, ipv4_only: bool) -> io::Result<SocketAddr> {
+    tokio::net::lookup_host(remote)
+        .await?
+        .find(|addr| !ipv4_only || addr.is_ipv4())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "unable to resolve remote host name",
+            )
+        })
 }
